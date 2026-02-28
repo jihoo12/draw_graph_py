@@ -35,25 +35,22 @@ def look_at_rh(eye, center, up):
     ], dtype=np.float32)
 
 # ---------------------------------------------------------
-# 2. 데이터 생성 함수 (3면 격자 추가)
+# 2. 데이터 생성 함수 (멀티 그래프 지원)
 # ---------------------------------------------------------
-def plot_wireframe(X, Y, Z):
+def plot_wireframe(X, Y, Z, base_color=(0.1, 0.6, 1.0)):
     rows, cols = X.shape
+    r_base, g_base, b_base = base_color
+    
+    # 높이에 따른 간단한 명암 차이 부여
     Y_min, Y_max = Y.min(), Y.max()
-    # 분모가 0이 되는 것을 방지
-    denom = Y_max - Y_min
-    if denom == 0:
-        Y_norm = np.zeros_like(Y)
-    else:
-        Y_norm = (Y - Y_min) / denom
+    denom = Y_max - Y_min if Y_max != Y_min else 1.0
+    Y_norm = (Y - Y_min) / denom
     
-    # R, G, B를 Y_norm과 동일한 크기의 배열로 생성
-    # Y_norm이 배열이므로 아래 연산 결과도 배열이 됩니다.
-    R = (0.1 * (1 - Y_norm)).astype(np.float32)
-    G = (0.6 * Y_norm + 0.2).astype(np.float32)
-    B = np.full_like(Y_norm, 1.0).astype(np.float32) # 전체를 1.0으로 채운 배열
+    # 입력받은 base_color를 바탕으로 정점 색상 생성 (높을수록 밝게)
+    R = (r_base * (0.6 + 0.4 * Y_norm)).astype(np.float32)
+    G = (g_base * (0.6 + 0.4 * Y_norm)).astype(np.float32)
+    B = (b_base * (0.6 + 0.4 * Y_norm)).astype(np.float32)
     
-    # 이제 ravel()이 안전하게 작동합니다.
     vertices = np.stack([
         X.ravel(), Y.ravel(), Z.ravel(), 
         R.ravel(), G.ravel(), B.ravel()
@@ -62,12 +59,12 @@ def plot_wireframe(X, Y, Z):
     idx = np.arange(rows * cols).reshape(rows, cols)
     h_lines = np.stack([idx[:, :-1].ravel(), idx[:, 1:].ravel()], axis=1)
     v_lines = np.stack([idx[:-1, :].ravel(), idx[1:, :].ravel()], axis=1)
-    indices = np.vstack([h_lines, v_lines]).astype(np.uint16).ravel()
+    # 인덱스 수가 많아질 수 있으므로 uint32 사용
+    indices = np.vstack([h_lines, v_lines]).astype(np.uint32).ravel()
     
     return vertices.flatten(), indices
 
 def create_full_grid_data(size=10, divisions=10):
-    """XZ(바닥), XY(뒷면), YZ(옆면) 3개 면의 격자 생성"""
     vertices = []
     indices = []
     step = size / divisions
@@ -82,35 +79,36 @@ def create_full_grid_data(size=10, divisions=10):
         indices.extend([curr_idx, curr_idx + 1])
         curr_idx += 2
 
-    # 색상 정의
-    c_xz = (0.3, 0.3, 0.3) # 바닥 (회색)
-    c_xy = (0.2, 0.3, 0.2) # 뒷면 (연녹조)
-    c_yz = (0.3, 0.2, 0.2) # 옆면 (연적조)
+    c_xz = (0.3, 0.3, 0.3) 
+    c_xy = (0.2, 0.3, 0.2) 
+    c_yz = (0.3, 0.2, 0.2) 
 
     for i in range(divisions + 1):
         d = start + i * step
-        # 1. XZ 평면 (바닥: y=start)
         add_line([d, start, start], [d, start, end], c_xz)
         add_line([start, start, d], [end, start, d], c_xz)
-        
-        # 2. XY 평면 (뒷벽: z=start)
         add_line([d, start, start], [d, end, start], c_xy)
         add_line([start, d, start], [end, d, start], c_xy)
-        
-        # 3. YZ 평면 (옆벽: x=start)
         add_line([start, d, start], [start, d, end], c_yz)
         add_line([start, start, d], [start, end, d], c_yz)
 
     return np.array(vertices, dtype=np.float32), np.array(indices, dtype=np.uint16)
 
 # ---------------------------------------------------------
-# 3. WGSL 셰이더 및 앱 클래스
+# 3. WGSL 셰이더
 # ---------------------------------------------------------
 shader_source = """
 struct CameraUniform { view_proj: mat4x4<f32> };
 @group(0) @binding(0) var<uniform> camera: CameraUniform;
-struct VertexInput { @location(0) position: vec3<f32>, @location(1) color: vec3<f32> };
-struct VertexOutput { @builtin(position) clip_pos: vec4<f32>, @location(0) color: vec3<f32> };
+
+struct VertexInput { 
+    @location(0) position: vec3<f32>, 
+    @location(1) color: vec3<f32> 
+};
+struct VertexOutput { 
+    @builtin(position) clip_pos: vec4<f32>, 
+    @location(0) color: vec3<f32> 
+};
 
 @vertex
 fn vs_main(model: VertexInput) -> VertexOutput {
@@ -126,8 +124,11 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 }
 """
 
+# ---------------------------------------------------------
+# 4. 앱 클래스 (멀티 그래프 관리)
+# ---------------------------------------------------------
 class App:
-    def __init__(self, canvas, vertex_data, index_data):
+    def __init__(self, canvas, graphs_data_list):
         self.canvas = canvas
         self.yaw, self.pitch, self.camera_radius = np.radians(-45), np.radians(20), 15.0
         self.is_dragging = False
@@ -145,12 +146,18 @@ class App:
         self.present_format = self.present_context.get_preferred_format(self.adapter)
         self.present_context.configure(device=self.device, format=self.present_format)
 
-        # 메인 그래프 버퍼
-        self.index_count = len(index_data)
-        self.vertex_buffer = self.device.create_buffer_with_data(data=vertex_data, usage=wgpu.BufferUsage.VERTEX)
-        self.index_buffer = self.device.create_buffer_with_data(data=index_data, usage=wgpu.BufferUsage.INDEX)
+        # 여러 개의 그래프 리소스 관리
+        self.graph_resources = []
+        for v_data, i_data in graphs_data_list:
+            v_buf = self.device.create_buffer_with_data(data=v_data, usage=wgpu.BufferUsage.VERTEX)
+            i_buf = self.device.create_buffer_with_data(data=i_data, usage=wgpu.BufferUsage.INDEX)
+            self.graph_resources.append({
+                "v_buf": v_buf,
+                "i_buf": i_buf,
+                "index_count": len(i_data)
+            })
 
-        # 3면 격자 버퍼 생성
+        # 3면 격자 버퍼
         grid_verts, grid_indices = create_full_grid_data(size=10, divisions=10)
         self.grid_index_count = len(grid_indices)
         self.grid_vertex_buffer = self.device.create_buffer_with_data(data=grid_verts, usage=wgpu.BufferUsage.VERTEX)
@@ -220,15 +227,16 @@ class App:
         render_pass.set_pipeline(self.pipeline)
         render_pass.set_bind_group(0, self.camera_bind_group, [])
 
-        # 1. 3면 격자 그리기
+        # 1. 3면 격자 그리기 (uint16 포맷)
         render_pass.set_vertex_buffer(0, self.grid_vertex_buffer, 0, self.grid_vertex_buffer.size)
         render_pass.set_index_buffer(self.grid_index_buffer, wgpu.IndexFormat.uint16, 0, self.grid_index_buffer.size)
         render_pass.draw_indexed(self.grid_index_count, 1, 0, 0, 0)
 
-        # 2. 메인 그래프 그리기
-        render_pass.set_vertex_buffer(0, self.vertex_buffer, 0, self.vertex_buffer.size)
-        render_pass.set_index_buffer(self.index_buffer, wgpu.IndexFormat.uint16, 0, self.index_buffer.size)
-        render_pass.draw_indexed(self.index_count, 1, 0, 0, 0)
+        # 2. 모든 그래프 그리기 (uint32 포맷)
+        for graph in self.graph_resources:
+            render_pass.set_vertex_buffer(0, graph["v_buf"], 0, graph["v_buf"].size)
+            render_pass.set_index_buffer(graph["i_buf"], wgpu.IndexFormat.uint32, 0, graph["i_buf"].size)
+            render_pass.draw_indexed(graph["index_count"], 1, 0, 0, 0)
 
         render_pass.end()
         self.device.queue.submit([encoder.finish()])
@@ -237,17 +245,32 @@ class App:
         self.device = None
         gc.collect()
 
+# ---------------------------------------------------------
+# 5. 메인 실행부
+# ---------------------------------------------------------
 def main():
     x = np.linspace(-4, 4, 50)
     z = np.linspace(-4, 4, 50)
     X, Z = np.meshgrid(x, z)
-    # 물결 모양 함수
-    Y = np.sin(np.sqrt(X**2 + Z**2)) 
     
-    vertex_data, index_data = plot_wireframe(X, Y, Z)
-    canvas = RenderCanvas(title="WGPU 3D Plot - 3 Sided Grid", size=(1000, 800))
-    app = App(canvas, vertex_data, index_data)
+    # 렌더링할 그래프 리스트 생성
+    graphs_to_render = []
+
+    # 그래프 1: 중앙으로 퍼지는 물결 (하늘색 계열)
+    Y1 = np.sin(np.sqrt(X**2 + Z**2))
+    graphs_to_render.append(plot_wireframe(X, Y1, Z, base_color=(0.1, 0.6, 1.0)))
+    
+    # 그래프 2: 완만한 사인파 (빨간색 계열)
+    Y2 = np.sin(np.sqrt(X**2 + Z**2)+1)
+    graphs_to_render.append(plot_wireframe(X, Y2, Z, base_color=(0.8, 0.4, 1.0)))
+
+    Y3 = np.sin(np.sqrt(X**2 + Z**2)+2)
+    graphs_to_render.append(plot_wireframe(X, Y3, Z, base_color=(1.0, 0.5, 0.0)))
+
+    canvas = RenderCanvas(title="WGPU Multi-Graph Plot", size=(1000, 800))
+    app = App(canvas, graphs_to_render)
     canvas.request_draw(app.draw_frame)
+    
     try:
         loop.run()
     except KeyboardInterrupt: pass
