@@ -35,19 +35,30 @@ def look_at_rh(eye, center, up):
     ], dtype=np.float32)
 
 # ---------------------------------------------------------
-# 2. 데이터 생성 함수
+# 2. 데이터 생성 함수 (3면 격자 추가)
 # ---------------------------------------------------------
 def plot_wireframe(X, Y, Z):
     rows, cols = X.shape
     Y_min, Y_max = Y.min(), Y.max()
-    Y_norm = (Y - Y_min) / (Y_max - Y_min + 1e-6) if Y_max > Y_min else np.zeros_like(Y)
+    # 분모가 0이 되는 것을 방지
+    denom = Y_max - Y_min
+    if denom == 0:
+        Y_norm = np.zeros_like(Y)
+    else:
+        Y_norm = (Y - Y_min) / denom
     
-    # 높이에 따른 색상 (Cyan 계열 예시)
-    R = 0.2 * (1 - Y_norm)
-    G = 0.8 * Y_norm + 0.2
-    B = 1.0 * Y_norm
+    # R, G, B를 Y_norm과 동일한 크기의 배열로 생성
+    # Y_norm이 배열이므로 아래 연산 결과도 배열이 됩니다.
+    R = (0.1 * (1 - Y_norm)).astype(np.float32)
+    G = (0.6 * Y_norm + 0.2).astype(np.float32)
+    B = np.full_like(Y_norm, 1.0).astype(np.float32) # 전체를 1.0으로 채운 배열
     
-    vertices = np.stack([X.ravel(), Y.ravel(), Z.ravel(), R.ravel(), G.ravel(), B.ravel()], axis=1).astype(np.float32)
+    # 이제 ravel()이 안전하게 작동합니다.
+    vertices = np.stack([
+        X.ravel(), Y.ravel(), Z.ravel(), 
+        R.ravel(), G.ravel(), B.ravel()
+    ], axis=1).astype(np.float32)
+    
     idx = np.arange(rows * cols).reshape(rows, cols)
     h_lines = np.stack([idx[:, :-1].ravel(), idx[:, 1:].ravel()], axis=1)
     v_lines = np.stack([idx[:-1, :].ravel(), idx[1:, :].ravel()], axis=1)
@@ -55,28 +66,45 @@ def plot_wireframe(X, Y, Z):
     
     return vertices.flatten(), indices
 
-def create_grid_data(size=10, divisions=10, color=(0.4, 0.4, 0.4)):
+def create_full_grid_data(size=10, divisions=10):
+    """XZ(바닥), XY(뒷면), YZ(옆면) 3개 면의 격자 생성"""
     vertices = []
     indices = []
     step = size / divisions
-    half_size = size / 2
+    start = -size / 2
+    end = size / 2
+    
     curr_idx = 0
+    def add_line(p1, p2, color):
+        nonlocal curr_idx
+        vertices.extend([*p1, *color])
+        vertices.extend([*p2, *color])
+        indices.extend([curr_idx, curr_idx + 1])
+        curr_idx += 2
+
+    # 색상 정의
+    c_xz = (0.3, 0.3, 0.3) # 바닥 (회색)
+    c_xy = (0.2, 0.3, 0.2) # 뒷면 (연녹조)
+    c_yz = (0.3, 0.2, 0.2) # 옆면 (연적조)
+
     for i in range(divisions + 1):
-        pos = -half_size + i * step
-        # Z축 평행선
-        vertices.extend([pos, 0, -half_size, *color])
-        vertices.extend([pos, 0,  half_size, *color])
-        indices.extend([curr_idx, curr_idx + 1])
-        curr_idx += 2
-        # X축 평행선
-        vertices.extend([-half_size, 0, pos, *color])
-        vertices.extend([ half_size, 0, pos, *color])
-        indices.extend([curr_idx, curr_idx + 1])
-        curr_idx += 2
+        d = start + i * step
+        # 1. XZ 평면 (바닥: y=start)
+        add_line([d, start, start], [d, start, end], c_xz)
+        add_line([start, start, d], [end, start, d], c_xz)
+        
+        # 2. XY 평면 (뒷벽: z=start)
+        add_line([d, start, start], [d, end, start], c_xy)
+        add_line([start, d, start], [end, d, start], c_xy)
+        
+        # 3. YZ 평면 (옆벽: x=start)
+        add_line([start, d, start], [start, d, end], c_yz)
+        add_line([start, start, d], [start, end, d], c_yz)
+
     return np.array(vertices, dtype=np.float32), np.array(indices, dtype=np.uint16)
 
 # ---------------------------------------------------------
-# 3. WGSL 셰이더
+# 3. WGSL 셰이더 및 앱 클래스
 # ---------------------------------------------------------
 shader_source = """
 struct CameraUniform { view_proj: mat4x4<f32> };
@@ -98,13 +126,10 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 }
 """
 
-# ---------------------------------------------------------
-# 4. 앱 클래스
-# ---------------------------------------------------------
 class App:
     def __init__(self, canvas, vertex_data, index_data):
         self.canvas = canvas
-        self.yaw, self.pitch, self.camera_radius = np.radians(-45), np.radians(30), 12.0
+        self.yaw, self.pitch, self.camera_radius = np.radians(-45), np.radians(20), 15.0
         self.is_dragging = False
         self.last_mouse_pos = None
 
@@ -120,13 +145,13 @@ class App:
         self.present_format = self.present_context.get_preferred_format(self.adapter)
         self.present_context.configure(device=self.device, format=self.present_format)
 
-        # 1. 메인 그래프 버퍼
+        # 메인 그래프 버퍼
         self.index_count = len(index_data)
         self.vertex_buffer = self.device.create_buffer_with_data(data=vertex_data, usage=wgpu.BufferUsage.VERTEX)
         self.index_buffer = self.device.create_buffer_with_data(data=index_data, usage=wgpu.BufferUsage.INDEX)
 
-        # 2. 격자 바닥 버퍼 (이 부분이 수정되었습니다)
-        grid_verts, grid_indices = create_grid_data(size=10, divisions=20)
+        # 3면 격자 버퍼 생성
+        grid_verts, grid_indices = create_full_grid_data(size=10, divisions=10)
         self.grid_index_count = len(grid_indices)
         self.grid_vertex_buffer = self.device.create_buffer_with_data(data=grid_verts, usage=wgpu.BufferUsage.VERTEX)
         self.grid_index_buffer = self.device.create_buffer_with_data(data=grid_indices, usage=wgpu.BufferUsage.INDEX)
@@ -165,7 +190,7 @@ class App:
             self.last_mouse_pos = (e["x"], e["y"])
             self.canvas.request_draw()
     def on_wheel(self, e):
-        self.camera_radius = np.clip(self.camera_radius + e["dy"] * 0.01, 2.0, 50.0)
+        self.camera_radius = np.clip(self.camera_radius + e["dy"] * 0.02, 2.0, 50.0)
         self.canvas.request_draw()
     def on_resize(self, e): self.canvas.request_draw()
 
@@ -174,7 +199,6 @@ class App:
         w, h, _ = current_texture.size
         if w == 0 or h == 0: return
 
-        # 카메라 행렬 업데이트
         proj = perspective_rh(np.radians(45), w/h, 0.1, 100.0)
         eye = np.array([
             self.camera_radius * np.cos(self.pitch) * np.cos(self.yaw),
@@ -184,28 +208,27 @@ class App:
         view = look_at_rh(eye, np.array([0,0,0], dtype=np.float32), np.array([0,1,0], dtype=np.float32))
         self.device.queue.write_buffer(self.camera_buffer, 0, (proj @ view).T.astype(np.float32).tobytes())
 
-        # 깊이 텍스처 관리
         if self.depth_texture is None or self.depth_texture.size[:2] != (w, h):
             self.depth_texture = self.device.create_texture(size=(w, h, 1), usage=wgpu.TextureUsage.RENDER_ATTACHMENT, format=wgpu.TextureFormat.depth32float)
             self.depth_view = self.depth_texture.create_view()
 
         encoder = self.device.create_command_encoder()
         render_pass = encoder.begin_render_pass(
-            color_attachments=[{"view": current_texture.create_view(), "clear_value": (0.05, 0.05, 0.1, 1), "load_op": wgpu.LoadOp.clear, "store_op": wgpu.StoreOp.store}],
+            color_attachments=[{"view": current_texture.create_view(), "clear_value": (0.02, 0.02, 0.05, 1), "load_op": wgpu.LoadOp.clear, "store_op": wgpu.StoreOp.store}],
             depth_stencil_attachment={"view": self.depth_view, "depth_clear_value": 1.0, "depth_load_op": wgpu.LoadOp.clear, "depth_store_op": wgpu.StoreOp.store}
         )
         render_pass.set_pipeline(self.pipeline)
         render_pass.set_bind_group(0, self.camera_bind_group, [])
 
-        # 1. 메인 그래프 그리기
-        render_pass.set_vertex_buffer(0, self.vertex_buffer, 0, self.vertex_buffer.size)
-        render_pass.set_index_buffer(self.index_buffer, wgpu.IndexFormat.uint16, 0, self.index_buffer.size)
-        render_pass.draw_indexed(self.index_count, 1, 0, 0, 0)
-
-        # 2. 격자 바닥 그리기
+        # 1. 3면 격자 그리기
         render_pass.set_vertex_buffer(0, self.grid_vertex_buffer, 0, self.grid_vertex_buffer.size)
         render_pass.set_index_buffer(self.grid_index_buffer, wgpu.IndexFormat.uint16, 0, self.grid_index_buffer.size)
         render_pass.draw_indexed(self.grid_index_count, 1, 0, 0, 0)
+
+        # 2. 메인 그래프 그리기
+        render_pass.set_vertex_buffer(0, self.vertex_buffer, 0, self.vertex_buffer.size)
+        render_pass.set_index_buffer(self.index_buffer, wgpu.IndexFormat.uint16, 0, self.index_buffer.size)
+        render_pass.draw_indexed(self.index_count, 1, 0, 0, 0)
 
         render_pass.end()
         self.device.queue.submit([encoder.finish()])
@@ -215,13 +238,14 @@ class App:
         gc.collect()
 
 def main():
-    x = np.linspace(-4, 4, 60)
-    z = np.linspace(-4, 4, 60)
+    x = np.linspace(-4, 4, 50)
+    z = np.linspace(-4, 4, 50)
     X, Z = np.meshgrid(x, z)
-    Y = np.sin(np.sqrt(X**2 + Z**2)) # 함수: 물결 모양
+    # 물결 모양 함수
+    Y = np.sin(np.sqrt(X**2 + Z**2)) 
     
     vertex_data, index_data = plot_wireframe(X, Y, Z)
-    canvas = RenderCanvas(title="WGPU 3D Plot with Grid Floor", size=(1000, 700))
+    canvas = RenderCanvas(title="WGPU 3D Plot - 3 Sided Grid", size=(1000, 800))
     app = App(canvas, vertex_data, index_data)
     canvas.request_draw(app.draw_frame)
     try:
